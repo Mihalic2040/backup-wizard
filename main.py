@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import gzip
+import hashlib
 import importlib
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -13,6 +15,9 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 TEMP_DIR = BASE_DIR / "temp"
 BACKUP_DIR = BASE_DIR / "backup"
+FULL_VERIFY_LIMIT_BYTES = 20 * 1024 * 1024
+SAMPLE_CHUNK_COUNT = 10
+SAMPLE_CHUNK_SIZE_BYTES = 100 * 1024
 
 
 def load_dotenv_file(dotenv_path: Path) -> None:
@@ -267,6 +272,97 @@ def encrypt_file(source_path: Path, output_path: Path, encryption_key: str) -> N
     run_command(command, env=env)
 
 
+def sha256_bytes(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file_handle:
+        for chunk in iter(lambda: file_handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def compute_sample_chunk_size(file_size: int) -> int:
+    if file_size <= 0:
+        raise RuntimeError("Cannot verify an empty backup file")
+    max_chunk_size = max(1, file_size // SAMPLE_CHUNK_COUNT)
+    return min(SAMPLE_CHUNK_SIZE_BYTES, max_chunk_size)
+
+
+def read_file_range(path: Path, start: int, size: int) -> bytes:
+    with path.open("rb") as file_handle:
+        file_handle.seek(start)
+        return file_handle.read(size)
+
+
+def build_sample_offsets(file_size: int, chunk_size: int) -> list[int]:
+    max_start = max(0, file_size - chunk_size)
+    if max_start == 0:
+        return [0]
+
+    generator = random.SystemRandom()
+    offsets = {0, max_start}
+    while len(offsets) < SAMPLE_CHUNK_COUNT:
+        offsets.add(generator.randint(0, max_start))
+    return sorted(offsets)
+
+
+def fetch_remote_range(client, config: Config, object_key: str, start: int, end: int) -> bytes:
+    response = client.get_object(
+        Bucket=config.bucket_name,
+        Key=object_key,
+        Range=f"bytes={start}-{end}",
+    )
+    return response["Body"].read()
+
+
+def verify_uploaded_backup(config: Config, encrypted_file: Path, object_key: str) -> None:
+    file_size = encrypted_file.stat().st_size
+    client = create_s3_client(config)
+
+    try:
+        head = client.head_object(Bucket=config.bucket_name, Key=object_key)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to inspect uploaded backup object: {exc}") from exc
+
+    remote_size = head.get("ContentLength")
+    if remote_size != file_size:
+        raise RuntimeError(
+            "Uploaded backup size does not match local file size. "
+            f"local={file_size} remote={remote_size}"
+        )
+
+    if file_size <= FULL_VERIFY_LIMIT_BYTES:
+        local_hash = sha256_file(encrypted_file)
+        try:
+            response = client.get_object(Bucket=config.bucket_name, Key=object_key)
+            remote_hash = sha256_bytes(response["Body"].read())
+        except Exception as exc:
+            raise RuntimeError(f"Failed to download uploaded backup for verification: {exc}") from exc
+
+        if local_hash != remote_hash:
+            raise RuntimeError("Uploaded backup full-file verification failed")
+        return
+
+    chunk_size = compute_sample_chunk_size(file_size)
+    sample_offsets = build_sample_offsets(file_size, chunk_size)
+    for start in sample_offsets:
+        end = min(file_size - 1, start + chunk_size - 1)
+        local_chunk = read_file_range(encrypted_file, start, end - start + 1)
+        try:
+            remote_chunk = fetch_remote_range(client, config, object_key, start, end)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to download uploaded backup range for verification: {exc}") from exc
+
+        if sha256_bytes(local_chunk) != sha256_bytes(remote_chunk):
+            raise RuntimeError(
+                "Uploaded backup sampled verification failed. "
+                f"offset={start} size={end - start + 1}"
+            )
+
+
 def upload_backup(config: Config, encrypted_file: Path) -> str:
     object_key = build_object_key(config.object_storage_prefix, encrypted_file.name)
     try:
@@ -336,6 +432,7 @@ def main() -> int:
         compress_file(backup_paths.dump_file, backup_paths.compressed_file)
         encrypt_file(backup_paths.compressed_file, backup_paths.encrypted_file, config.encryption_key)
         object_key = upload_backup(config, backup_paths.encrypted_file)
+        verify_uploaded_backup(config, backup_paths.encrypted_file, object_key)
         cleanup_local_files(
             config.data_retention_days,
             protected_paths={
@@ -354,6 +451,7 @@ def main() -> int:
     print(f"Compressed file: {backup_paths.compressed_file}")
     print(f"Encrypted backup: {backup_paths.encrypted_file}")
     print(f"Uploaded object: s3://{config.bucket_name}/{object_key}")
+    print("Upload verification: passed")
     return 0
 
 

@@ -9,6 +9,7 @@ The container does three steps in order:
 
 After encryption, the app uploads the final file to your S3-compatible bucket and removes expired files based on the retention setting.
 If the configured bucket does not exist yet, the job attempts to create it before uploading.
+After upload, the app verifies the remote object against the local encrypted file. Files up to 20 MB are verified end-to-end by downloading the full object and comparing hashes. Larger files are verified by hashing 10 random 100 KB byte ranges locally and comparing them with the same ranges downloaded from object storage.
 
 The app creates these directories in the project root if they do not already exist:
 
