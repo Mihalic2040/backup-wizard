@@ -1,0 +1,12 @@
+services:
+  backup-wizard:
+    build:
+      context: .
+    env_file:
+      - .env
+    working_dir: /app
+    volumes:
+      - ./:/app
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    command: ["python", "main.py"]
